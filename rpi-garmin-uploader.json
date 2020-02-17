@@ -1,0 +1,10 @@
+{
+	"disk_device": "Edge 500",
+	"sleep_time": "5",
+	"log_level": "INFO",
+	"log_file": "rpi-garmin-uploader.log",
+	"scsi_search_string": "Garmin",
+	"mount_point": "/mnt",
+	"garmin_user": "xxxxxxxx",
+	"garmin_password": "yyyyyyyy"
+}
