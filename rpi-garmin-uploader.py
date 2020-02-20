@@ -218,7 +218,7 @@ def create_import_file(list_to_import):
 
 # Upload files to garmin connect. For files uploaded, register uploaded state 
 # in database ... so they will never be uploaded again
-def upload(state):
+def upload(state,conn):
     logging.debug(state)
     entries_on_disk = os.listdir(activity_dest_dir)
     entries_already_imported=db_get_imported_activities(conn)
@@ -263,7 +263,7 @@ def main():
         elif state == 'umount':
             state=umount(state)
         elif state == 'upload':
-            state=upload(state)
+            state=upload(state,conn)
         else:            
             idle() 
 
