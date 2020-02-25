@@ -1,10 +1,19 @@
 {
-	"disk_device": "Edge 500",
-	"sleep_time": "5",
-	"log_level": "INFO",
-	"log_file": "rpi-garmin-uploader.log",
-	"scsi_search_string": "Garmin",
-	"mount_point": "/mnt",
-	"garmin_user": "xxxxxxxx",
-	"garmin_password": "yyyyyyyy"
+	"global": {
+		"sleep_time": "5",
+		"log_level": "INFO",
+		"log_file": "rpi-garmin-uploader.log",
+		"mount_point": "/mnt",
+		"disk_device": "Edge 500",
+		"scsi_search_string": "Garmin",
+		"activity_type": "mountain_biking"
+	},
+	"devices": {
+		"1111111111": {
+			"garmin_user": "garmin_user1",
+			"garmin_password": "garmin_password1",
+			"activity_type": "mountain_biking",
+			"activity_dest_dir":  "Activities_user1"
+		}
+	}
 }

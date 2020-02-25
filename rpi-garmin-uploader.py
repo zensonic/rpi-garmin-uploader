@@ -40,9 +40,9 @@ import os
 import json
 import re
 import sys
-
 import sqlite3
 from sqlite3 import Error
+from xml.dom import minidom
 
 parser = argparse.ArgumentParser(description='Import workouts from garmin devices to garmin connect using an rpi')
 parser.add_argument('--config', help='config file')
@@ -59,23 +59,35 @@ if args.config:
         data = json.load(json_file)
 
 # expand variables or provide sane defaults
-log_level           = data.get('log_level','INFO')
-log_file            = data.get('log_file',os.path.basename(__file__) + ".log")
-sleep_time          = int(data.get('sleep_time','1'))
-scsi_search_string  = data.get('scsi_search_string','Garmin')
-mount_point         = data.get('mount_point','/mnt')
-activity_dest_dir   = data.get('activity_dest_dir','Activities')
-activity_src_dir    = data.get('activity_src_dir','Garmin/Activities')
-activity_sync_dir   = mount_point + "/" + activity_src_dir
-garmin_user         = data.get('garmin_user')
-garmin_password     = data.get('garmin_password')
-sqlite3_db_name     = data.get('sqlite3_db_name','garminconnect.db')
-tmp_import_file     = data.get('tmp_import_file','/tmp/import_activities.csv')
+
+def default_vars():
+    vars= {
+            'log_level':          'INFO',
+            'log_file':           os.path.basename(__file__) + ".log",
+            'sleep_time':         '1',
+            'scsi_search_string': 'Garmin',
+            'mount_point':        '/mnt',
+            'activity_dest_dir':  'Activities',
+            'activity_src_dir' :  'Garmin/Activities',
+            'sqlite3_db_name':    'garminconnect.db',
+            'tmp_import_file':    '/tmp/import_activities.csv'
+            }
+    return vars
+
+def update_vars(vars,jsonvars):
+    for k in jsonvars.keys():
+        vars[k]=jsonvars[k]
+
+vars=default_vars()
+
+global_vars=data.get('global')
+if global_vars:
+    update_vars(vars,global_vars)
 
 # Get a logger
-logging.basicConfig(level=log_level,
+logging.basicConfig(level=vars['log_level'],
     format='%(asctime)s [%(levelname)s] %(message)s',
-    filename=log_file)
+    filename=vars['log_file'])
 
 # pyudev startup
 context = pyudev.Context()
@@ -104,7 +116,7 @@ def db_connection(db_file):
 
 # Inite tables if not exists
 def db_init_tables(conn):
-    sql="CREATE TABLE IF NOT EXISTS imported_activities (activity text PRIMARY KEY);"
+    sql="CREATE TABLE IF NOT EXISTS imported_activities (activity text PRIMARY KEY, user text not null);"
 
     try:
         c = conn.cursor()
@@ -113,25 +125,39 @@ def db_init_tables(conn):
         logging.error("Could not ensure sqlite3 table was created: {}".format(e))
 
 # Get all imported activities
-def db_get_imported_activities(conn):
-    sql="SELECT * from imported_activities order by activity"
+def db_get_imported_activities(conn,user):
+    sql="SELECT * from imported_activities where user=? order by activity"
 
     rows=[]
     try:
         cur = conn.cursor()
-        cur.execute(sql)
+        cur.execute(sql, (user,))
         rows = cur.fetchall()
     except Error as e:
-        loggint.error("Could not query db: {}".format(e))
+        logging.error("Could not query db: {}".format(e))
     return rows
 
 # Insert a single instance into the database
-def db_insert_activity(conn,a):
-    sql="INSERT OR IGNORE INTO imported_activities (activity) VALUES (?)"
+def db_insert_activity(conn,a,user):
+    sql="INSERT OR IGNORE INTO imported_activities (activity,user) VALUES (?,?)"
     cur = conn.cursor()
+    a.append(user)
     cur.execute(sql, a)
     conn.commit()
     return cur.lastrowid
+
+def get_garmin_device_id(mount_point):
+    f=mount_point + "/Garmin/GarminDevice.xml"
+    gdi=None
+    if  os.path.isfile(f):
+        doc = minidom.parse(f)
+        gid = doc.getElementsByTagName('Id')
+        if gid:
+            for e in gid:
+                e.normalize()
+                if(e.firstChild.data):
+                        gdi=e.firstChild.data
+    return gdi
 
 # Mount the garmin storage
 def mount(state):
@@ -139,7 +165,10 @@ def mount(state):
     logging.debug(state)
 
     dev=None
+    gdi=None
     stream = os.popen('lsscsi')
+    scsi_search_string=vars['scsi_search_string']
+    mount_point=vars['mount_point']
     for d in stream.readlines():
         if(re.search(scsi_search_string,d)):
             dev=d.split()[-1]
@@ -155,16 +184,36 @@ def mount(state):
             stream = subprocess.Popen("mount " + dev + " " + mount_point,shell=True).wait()
             logging.info("Mount {} onto {}".format(dev,mount_point))
             if(stream == 0):
+                gdi=get_garmin_device_id(mount_point)
                 # If we managed to mount, then sync                    
-                state="sync"
+                state="get_gdi_specific_vars"
+
+
         else:
             # If it is already mounted, sync
-            state="sync"
-    return state
+            gdi=get_garmin_device_id(mount_point)
+            state="get_gdi_specific_vars"
+    return (state,gdi)
+
+def get_gdi_specific_vars(state,gdi):
+    dev_data=data.get('devices')
+    if dev_data:
+        specific=dev_data.get(gdi)
+        if (specific):
+            update_vars(vars,specific)
+            print(vars)
+    return "sync"
+    
 
 # Sync from garmin to internal storage
-def sync(state):
+def sync(state,gdi):
     logging.debug(state)
+
+    # if gdi exists, we might have device specific overrides
+
+    activity_dest_dir=vars['activity_dest_dir']
+    activity_sync_dir   = vars['mount_point'] + "/" + vars['activity_src_dir']
+    
     if not os.path.isdir(activity_dest_dir):
         os.mkdir(activity_dest_dir)
     if not os.path.isdir(activity_sync_dir):
@@ -182,6 +231,7 @@ def sync(state):
 # Umount garmin after sync
 def umount(state):
     logging.debug(state)
+    mount_point=vars['mount_point']
     stream = subprocess.Popen("umount " + mount_point,shell=True ).wait()
     if(stream == 0):
         logging.info("Umounted " + mount_point)
@@ -206,35 +256,36 @@ def to_import(on_disk,imported):
 # instaed of uploading everything we upload what we are missing
 # to upload based on state in database
 def create_import_file(list_to_import):
-    filename=tmp_import_file
+    filename=vars['tmp_import_file']
 
     f = open(filename,"w")
     f.write("filename,name,type\n")
     for i in list_to_import:
-        f.write("{}/{},,uncategorized\n".format(activity_dest_dir,i))
+        f.write("{}/{},,{}\n".format(vars['activity_dest_dir'],i,vars['activity_type']))
     f.close()
 
     return filename
 
 # Upload files to garmin connect. For files uploaded, register uploaded state 
 # in database ... so they will never be uploaded again
-def upload(state,conn):
+def upload(state,conn,gdi):
     logging.debug(state)
-    entries_on_disk = os.listdir(activity_dest_dir)
-    entries_already_imported=db_get_imported_activities(conn)
+    entries_on_disk = os.listdir(vars['activity_dest_dir'])
+    garmin_user=vars['garmin_user']
+    entries_already_imported=db_get_imported_activities(conn,garmin_user)
 
     list_to_import=to_import(entries_on_disk,entries_already_imported)
 
     if list_to_import:
         filename=create_import_file(list_to_import)
-        p=subprocess.run("gupload " + filename + " -u " + garmin_user +" -p " + garmin_password, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        f=open(log_file,"a")
+        p=subprocess.run("gupload " + filename + " -u " + garmin_user +" -p " + vars['garmin_password'], shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        f=open(vars['log_file'],"a")
         for l in p.stdout.splitlines():
             ld=l.decode()
             f.write(ld + "\n")
             if(re.search("already uploaded",ld) or re.search("Upload",ld)):
                 a=ld.split()[-1]
-                db_insert_activity(conn,[a])
+                db_insert_activity(conn,[a],garmin_user)
         f.close()
 
         if(p.returncode == 0):
@@ -247,23 +298,26 @@ def upload(state,conn):
 
 # When idle, sleep
 def idle():
+    sleep_time=vars['sleep_time']
     logging.debug("sleep {} seconds".format(sleep_time))
-    time.sleep(sleep_time)
+    time.sleep(int(sleep_time))
 
 # switch functions based on state
 def main():
     global state
-    conn=db_connection(sqlite3_db_name)
+    conn=db_connection(vars['sqlite3_db_name'])
     db_init_tables(conn)
     while True:
         if state == 'mount':
-            state=mount(state)
+            (state,gdi)=mount(state)
+        elif state == 'get_gdi_specific_vars':
+            (state)=get_gdi_specific_vars(state,gdi)
         elif state == 'sync':
-            state=sync(state)
+            state=sync(state,gdi)
         elif state == 'umount':
             state=umount(state)
         elif state == 'upload':
-            state=upload(state,conn)
+            state=upload(state,conn,gdi)
         else:            
             idle() 
 
