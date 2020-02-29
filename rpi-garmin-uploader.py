@@ -52,6 +52,11 @@ args = parser.parse_args()
 # Global state. We start in idle
 state="sleep"
 
+# Global device to process
+device_to_process=None
+block_devices_to_process=set()
+usb_devices_to_process={}
+
 # Load json config if given
 data={}
 if args.config:
@@ -64,8 +69,7 @@ def default_vars():
     vars= {
             'log_level':          'INFO',
             'log_file':           os.path.basename(__file__) + ".log",
-            'sleep_time':         '1',
-            'scsi_search_string': 'Garmin',
+            'sleep_time':         '5',
             'mount_point':        '/mnt',
             'activity_dest_dir':  'Activities',
             'activity_src_dir' :  'Garmin/Activities',
@@ -94,16 +98,24 @@ context = pyudev.Context()
 monitor = pyudev.Monitor.from_netlink(context)
 monitor.filter_by('usb')
 
+def locate_block_device(dev):
+    for child_dev in dev.children:
+        print(child_dev)
+
+
 # define and register pyudev callback
 def udev_event(action, device):
     global state
-    if(action == "bind" and state!= "mount"):
-        logging.info("We got usb bind event. Starting mount")
-        state="mount"
+    global usb_devices_to_process
+    if(action == "bind"):
+        logging.info("We got usb bind event.")
+        logging.debug(device)
+        logging.info("Adding usb device path {} to set of devices to process".format(device.device_path))
+        usb_devices_to_process[device.device_path]=0
+
 
 observer = pyudev.MonitorObserver(monitor, udev_event)
 observer.start()
-
 
 # Connect to the sqlite3 instance
 def db_connection(db_file):
@@ -164,25 +176,19 @@ def mount(state):
     logging.info("")
     logging.debug(state)
 
-    dev=None
     gdi=None
-    stream = os.popen('lsscsi')
-    scsi_search_string=vars['scsi_search_string']
     mount_point=vars['mount_point']
-    for d in stream.readlines():
-        if(re.search(scsi_search_string,d)):
-            dev=d.split()[-1]
 
-    if dev:
-        logging.info("Found scsi device matching '{}'".format(scsi_search_string))
+    if device_to_process:
+        logging.info("Going to mount '{}'".format(device_to_process))
         stream = os.popen('mount')
         already_mounted=False
         for l in stream.readlines():
-            if(re.search(dev,l)):
+            if(re.search(device_to_process,l)):
                 already_mounted=True
         if not already_mounted:
-            stream = subprocess.Popen("mount " + dev + " " + mount_point,shell=True).wait()
-            logging.info("Mount {} onto {}".format(dev,mount_point))
+            stream = subprocess.Popen("mount " + device_to_process + " " + mount_point,shell=True).wait()
+            logging.info("Mount {} onto {}".format(device_to_process,mount_point))
             if(stream == 0):
                 gdi=get_garmin_device_id(mount_point)
                 # If we managed to mount, then sync                    
@@ -201,7 +207,8 @@ def get_gdi_specific_vars(state,gdi):
         specific=dev_data.get(gdi)
         if (specific):
             update_vars(vars,specific)
-            print(vars)
+
+
     return "sync"
     
 
@@ -219,6 +226,7 @@ def sync(state,gdi):
     if not os.path.isdir(activity_sync_dir):
         logging.error(activity_sync_dir + " does not exist. Can't sync from it")
     else:
+        logging.info("Going to sync {} to {}".format(activity_sync_dir,activity_dest_dir)) 
         p=subprocess.run("rsync -av " + activity_sync_dir + "/ " + activity_dest_dir + "/",shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT )
         if(p.returncode == 0):
             logging.info("sync ok") 
@@ -226,7 +234,7 @@ def sync(state,gdi):
             logging.error("Could not sync")
         for l in p.stdout.splitlines():
             logging.info(l.decode())
-    return "umount"
+    return "upload"
 
 # Umount garmin after sync
 def umount(state):
@@ -237,7 +245,7 @@ def umount(state):
         logging.info("Umounted " + mount_point)
     else: 
         logging.error("Could not umount " + mount_point)
-    return "upload"
+    return "sleep"
 
 
 # Calculate what activities to upload based on what we have 
@@ -273,10 +281,10 @@ def upload(state,conn,gdi):
     entries_on_disk = os.listdir(vars['activity_dest_dir'])
     garmin_user=vars['garmin_user']
     entries_already_imported=db_get_imported_activities(conn,garmin_user)
-
     list_to_import=to_import(entries_on_disk,entries_already_imported)
 
     if list_to_import:
+        logging.info("Going to upload {} activities to garmin connect".format(len(list_to_import)))
         filename=create_import_file(list_to_import)
         p=subprocess.run("gupload " + filename + " -u " + garmin_user +" -p " + vars['garmin_password'], shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         f=open(vars['log_file'],"a")
@@ -293,14 +301,40 @@ def upload(state,conn,gdi):
         else: 
             logging.error("Could not upload files to garmin connect")
     else:
-        logging.info("No new activities to import")
-    return "sleep"
+        logging.info("No new activities to upload")
+    return "umount"
 
 # When idle, sleep
 def idle():
-    sleep_time=vars['sleep_time']
-    logging.debug("sleep {} seconds".format(sleep_time))
-    time.sleep(int(sleep_time))
+    global block_devices_to_process
+    global device_to_process
+    global state
+
+    # If no work to do, then sleep
+    device_to_process=None
+
+    # If there is no work, sleep
+    if len(block_devices_to_process)==0 and len(usb_devices_to_process)==0:
+        sleep_time=vars['sleep_time']
+        logging.debug("sleep {} seconds".format(sleep_time))
+        time.sleep(int(sleep_time))
+
+    for usb_path in usb_devices_to_process.copy().keys():
+        logging.debug(usb_path)
+        device=pyudev.Devices.from_path(context, usb_path)
+        for dev in device.children:
+            logging.debug(dev)
+            if(re.search("/block/",dev.device_path)):
+                blockdevice=dev.device_path.split("/")[-1]
+                if blockdevice:
+                    logging.info("Adding block device {} to set of devices to process".format("/dev/" + blockdevice))
+                    block_devices_to_process.add("/dev/" + blockdevice)
+                    usb_devices_to_process.pop(device,None)
+
+    if(len(block_devices_to_process)>0):
+        device_to_process=block_devices_to_process.pop()
+        logging.debug("Processing {}".format(device_to_process))
+        state="mount"
 
 # switch functions based on state
 def main():
@@ -313,11 +347,17 @@ def main():
         elif state == 'get_gdi_specific_vars':
             (state)=get_gdi_specific_vars(state,gdi)
         elif state == 'sync':
-            state=sync(state,gdi)
-        elif state == 'umount':
-            state=umount(state)
+            garmin_user=vars['garmin_user'] 
+            if garmin_user:
+                logging.info("Found valid garmin user {}. Going to sync".format(garmin_user))
+                state=sync(state,gdi)
+            else:
+                logging.info("Can not find valid garmin user. Not going to sync. Going to umount")
+                state="umount"                  
         elif state == 'upload':
             state=upload(state,conn,gdi)
+        elif state == 'umount':
+            state=umount(state)
         else:            
             idle() 
 

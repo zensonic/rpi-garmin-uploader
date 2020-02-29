@@ -4,8 +4,6 @@
 		"log_level": "INFO",
 		"log_file": "rpi-garmin-uploader.log",
 		"mount_point": "/mnt",
-		"disk_device": "Edge 500",
-		"scsi_search_string": "Garmin",
 		"activity_type": "mountain_biking"
 	},
 	"devices": {
